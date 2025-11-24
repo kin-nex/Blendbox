@@ -1,0 +1,5 @@
+.env
+.DS_Store
+screenshot
+temp_html_for_ai.html
+node_modules
