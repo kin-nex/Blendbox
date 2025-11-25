@@ -11,21 +11,6 @@ import sharp from "sharp";
 
 dotenv.config();
 
-const screenshotDir = path.join(process.cwd(), "screenshot");
-// Create dated subfolder: screenshot/YYYY-MM-DD
-const today = new Date().toISOString().split("T")[0];
-const datedScreenshotDir = path.join(screenshotDir, today);
-if (!fs.existsSync(datedScreenshotDir))
-	fs.mkdirSync(datedScreenshotDir, { recursive: true });
-
-function buildScreenshotDir(roaster, name) {
-	const safeRoaster = roaster.replace(/[^a-z0-9]/gi, "_");
-	const safeName = name.replace(/[^a-z0-9]/gi, "_");
-	const folder = path.join(datedScreenshotDir, safeRoaster);
-	if (!fs.existsSync(folder)) fs.mkdirSync(folder, { recursive: true });
-	return { folder, filename: `${safeName}.webp` };
-}
-
 const CONCURRENCY = 1;
 
 const axiosClient = axios.create({
@@ -73,7 +58,7 @@ async function checkOneItem(item) {
 	console.log(`${item.roaster} — ${item.name} (${item.url})`);
 
 	try {
-		const result = await fetchPageHTML(item.url, item.roaster, item.name);
+		const result = await fetchPageHTML(item.url);
 
 		// Detect missing screenshot — treat as error
 		if (!result.screenshotBase64) {
@@ -169,7 +154,7 @@ async function getPage() {
 	return browser;
 }
 
-async function fetchPageHTML(url, roaster, name) {
+async function fetchPageHTML(url) {
 	// Screenshot file path logic is no longer needed; all screenshots are in-memory base64
 
 	const browser = await getPage();
@@ -484,21 +469,42 @@ ${cleanedHtml.slice(0, 30000)}
 // NOTION FETCH
 // -----------------------------
 async function fetchNotionCatalog() {
-	const res = await fetch(
-		`https://api.notion.com/v1/databases/${process.env.NOTION_DB_ID}/query`,
-		{
-			method: "POST",
-			headers: {
-				Authorization: `Bearer ${process.env.NOTION_TOKEN}`,
-				"Notion-Version": "2022-06-28",
-				"Content-Type": "application/json",
+	const all = [];
+	let cursor;
+
+	while (true) {
+		const res = await fetch(
+			`https://api.notion.com/v1/databases/${process.env.NOTION_DB_ID}/query`,
+			{
+				method: "POST",
+				headers: {
+					Authorization: `Bearer ${process.env.NOTION_TOKEN}`,
+					"Notion-Version": "2022-06-28",
+					"Content-Type": "application/json",
+					"X-Cache-Buster": Date.now().toString(),
+				},
+				body: JSON.stringify({
+					start_cursor: cursor,
+					filter: {
+						property: "Name",
+						title: { is_not_empty: true },
+					},
+				}),
 			},
-		},
-	);
+		);
 
-	if (!res.ok) throw new Error("Failed to query Notion");
+		const data = await res.json();
+		if (!res.ok) {
+			throw new Error(`Failed to query Notion: ${JSON.stringify(data)}`);
+		}
 
-	return res.json();
+		all.push(...data.results);
+
+		if (!data.has_more) break;
+		cursor = data.next_cursor;
+	}
+
+	return { results: all };
 }
 
 function filterSellingItems(notionJson) {
@@ -542,7 +548,6 @@ async function sendSummaryEmail(results) {
 			},
 		},
 	);
-	// No screenshot files to clean up
 }
 
 function buildEmailHTML(unavailable, uncertain, available, errors) {
