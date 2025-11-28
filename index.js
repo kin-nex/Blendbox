@@ -1,3 +1,11 @@
+// Helper to strip HTML tags and condense whitespace
+function stripHTML(str) {
+	return (str || "")
+		.replace(/<[^>]*>/g, "")
+		.replace(/\s+/g, " ")
+		.trim();
+}
+
 import fs from "node:fs";
 import http from "node:http";
 import https from "node:https";
@@ -8,6 +16,10 @@ import { minify } from "html-minifier-terser";
 import fetch from "node-fetch";
 import { chromium } from "playwright";
 import sharp from "sharp";
+
+// CLI roaster filter argument
+const ROASTER_FILTER = process.argv[2]?.toLowerCase() || null;
+const MAX_COUNT = process.argv[3] ? parseInt(process.argv[3], 10) : null;
 
 dotenv.config();
 
@@ -23,14 +35,21 @@ const axiosClient = axios.create({
 // -----------------------------
 async function main() {
 	console.log("Starting Product Check…");
+	if (ROASTER_FILTER) {
+		console.log(`Applying roaster filter: ${ROASTER_FILTER}`);
+	}
+	if (MAX_COUNT) {
+		console.log(`Limiting to first ${MAX_COUNT} products`);
+	}
 
 	const notionData = await fetchNotionCatalog();
 	const items = filterSellingItems(notionData);
+	const limitedItems = MAX_COUNT ? items.slice(0, MAX_COUNT) : items;
 
 	const results = [];
 
 	// Batch + concurrency limit
-	const queue = [...items];
+	const queue = [...limitedItems];
 	const active = [];
 
 	while (queue.length > 0 || active.length > 0) {
@@ -57,8 +76,14 @@ async function main() {
 async function checkOneItem(item) {
 	console.log(`${item.roaster} — ${item.name} (${item.url})`);
 
+	// Keep track of screenshot so we can still attach it even if later steps fail
+	let lastScreenshotBase64 = null;
+
 	try {
 		const result = await fetchPageHTML(item.url);
+		if (result.screenshotBase64) {
+			lastScreenshotBase64 = result.screenshotBase64;
+		}
 
 		// Detect missing screenshot — treat as error
 		if (!result.screenshotBase64) {
@@ -72,8 +97,9 @@ async function checkOneItem(item) {
 			return {
 				...item,
 				ai_status: "error",
-				ai_reason:
+				ai_reason: stripHTML(
 					"Screenshot missing — page may not have loaded or blocked early",
+				),
 				screenshotBase64: null,
 			};
 		}
@@ -90,7 +116,7 @@ async function checkOneItem(item) {
 			return {
 				...item,
 				ai_status: "uncertain",
-				ai_reason: result.reason,
+				ai_reason: stripHTML(result.reason || "Page blocked or unavailable"),
 				screenshotBase64: result.screenshotBase64,
 			};
 		}
@@ -108,22 +134,28 @@ async function checkOneItem(item) {
 		return {
 			...item,
 			ai_status: ai.status,
-			ai_reason: ai.reason,
+			ai_reason: stripHTML(ai.reason),
 			screenshotBase64: result.screenshotBase64,
 		};
 	} catch (err) {
+		const rawErr = stripHTML(err?.message || "");
+		const truncatedErr = rawErr.slice(0, 300);
 		console.log(`
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 🔍 ${item.roaster} — ${item.name}
 ❗ Status: ERROR
-📝 Reason: ${err.message}
+📝 Reason (analysis / Deepseek failure): ${truncatedErr}
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 `);
+		// Use the last known screenshot if we have one; this covers AI or later-stage failures
+		const screenshotBase64 = lastScreenshotBase64;
 		return {
 			...item,
 			ai_status: "error",
-			ai_reason: err.message || "Unknown error",
-			screenshotBase64: null,
+			ai_reason: rawErr
+				? `Deepseek / analysis failed: ${truncatedErr}`
+				: "Deepseek / analysis failed (no error message)",
+			screenshotBase64,
 		};
 	}
 }
@@ -140,13 +172,6 @@ async function getPage() {
 			headless: true,
 			args: [
 				"--disable-blink-features=AutomationControlled",
-				"--disable-dev-shm-usage",
-				"--no-sandbox",
-				"--disable-setuid-sandbox",
-				"--disable-infobars",
-				"--disable-web-security",
-				"--disable-features=IsolateOrigins,site-per-process",
-				"--disable-blink-features",
 				"--window-size=1280,2000",
 			],
 		});
@@ -166,6 +191,17 @@ async function fetchPageHTML(url) {
 	const page = await context.newPage();
 	await page.setDefaultNavigationTimeout(30000);
 	await page.setDefaultTimeout(30000);
+
+	// Helper to safely take a screenshot and compress it to base64 (webp)
+	async function safeScreenshot() {
+		try {
+			const buf = await page.screenshot({ fullPage: true });
+			const compressed = await sharp(buf).webp({ quality: 60 }).toBuffer();
+			return compressed.toString("base64");
+		} catch {
+			return null;
+		}
+	}
 
 	// Inject your anti-stealth script into this *context*
 	await context.addInitScript(() => {
@@ -224,20 +260,37 @@ async function fetchPageHTML(url) {
 			waitUntil: "domcontentloaded",
 			timeout: 20000,
 		});
-	} catch {
-		// fallback for slow or bot-blocking pages
-		resp = await page.goto(url, {
-			waitUntil: "load",
-			timeout: 20000,
-		});
+	} catch (err) {
+		// fallback attempt
+		try {
+			resp = await page.goto(url, {
+				waitUntil: "load",
+				timeout: 20000,
+			});
+		} catch (err2) {
+			const screenshotBase64 = await safeScreenshot();
+			await context.close();
+			return {
+				blocked: true,
+				html: "",
+				screenshotBase64,
+				reason: "Navigation failed twice (early block or timeout)",
+			};
+		}
 	}
 
 	// Give Shopify JS time to render critical UI
 	await page.waitForTimeout(1500);
 
 	if (!resp) {
+		const screenshotBase64 = await safeScreenshot();
 		await context.close();
-		throw new Error("Navigation failed (no response)");
+		return {
+			blocked: true,
+			html: "",
+			screenshotBase64,
+			reason: "Navigation failed (no response)",
+		};
 	}
 
 	const status = resp.status();
@@ -440,7 +493,7 @@ URL: ${url}
 Below is raw HTML of the fetched page (may be truncated):
 IMPORTANT: The HTML may be malformed or truncated — you must still attempt best‑effort classification.
 
-${cleanedHtml.slice(0, 30000)}
+${cleanedHtml.slice(0, 60000)}
 `;
 
 	const res = await axiosClient.post(
@@ -511,7 +564,6 @@ function filterSellingItems(notionJson) {
 	return notionJson.results
 		.map((page) => {
 			const props = page.properties;
-
 			return {
 				name: props.Name?.title?.[0]?.plain_text ?? "Unnamed",
 				url: props["Link to product"]?.url ?? null,
@@ -519,7 +571,11 @@ function filterSellingItems(notionJson) {
 				selling: props["Selling?"]?.checkbox ?? false,
 			};
 		})
-		.filter((i) => i.selling && i.url);
+		.filter((i) => i.selling && i.url)
+		.filter((i) => {
+			if (!ROASTER_FILTER) return true;
+			return i.roaster.toLowerCase().includes(ROASTER_FILTER);
+		});
 }
 
 // -----------------------------
