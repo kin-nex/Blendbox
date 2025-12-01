@@ -493,7 +493,7 @@ URL: ${url}
 Below is raw HTML of the fetched page (may be truncated):
 IMPORTANT: The HTML may be malformed or truncated — you must still attempt best‑effort classification.
 
-${cleanedHtml.slice(0, 60000)}
+${cleanedHtml.slice(0, 30000)}
 `;
 
 	const res = await axiosClient.post(
