@@ -20,6 +20,7 @@ import sharp from "sharp";
 // CLI roaster filter argument
 const ROASTER_FILTER = process.argv[2]?.toLowerCase() || null;
 const MAX_COUNT = process.argv[3] ? parseInt(process.argv[3], 10) : null;
+const DEBUG = process.argv.includes("--debug");
 
 dotenv.config();
 
@@ -121,7 +122,7 @@ async function checkOneItem(item) {
 			};
 		}
 
-		const ai = await askDeepseek(result.html, item.url);
+		const ai = await askChatGPT(result.html, item.url, result.screenshotBase64);
 
 		console.log(`
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -138,23 +139,43 @@ async function checkOneItem(item) {
 			screenshotBase64: result.screenshotBase64,
 		};
 	} catch (err) {
+		if (DEBUG) {
+			console.error(
+				"[AI DEBUG] checkOneItem caught error for",
+				item.url,
+				":",
+				err,
+			);
+		}
+
+		if (DEBUG && err?.response) {
+			console.error(
+				"[AI DEBUG] HTTP status from AI call:",
+				err.response.status,
+			);
+			console.error(
+				"[AI DEBUG] Response data from AI call:",
+				JSON.stringify(err.response.data),
+			);
+		}
+
 		const rawErr = stripHTML(err?.message || "");
 		const truncatedErr = rawErr.slice(0, 300);
 		console.log(`
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 🔍 ${item.roaster} — ${item.name}
 ❗ Status: ERROR
-📝 Reason (analysis / Deepseek failure): ${truncatedErr}
+📝 Reason (analysis / ChatGPT failure): ${truncatedErr}
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 `);
-		// Use the last known screenshot if we have one; this covers AI or later-stage failures
+
 		const screenshotBase64 = lastScreenshotBase64;
 		return {
 			...item,
 			ai_status: "error",
 			ai_reason: rawErr
-				? `Deepseek / analysis failed: ${truncatedErr}`
-				: "Deepseek / analysis failed (no error message)",
+				? `ChatGPT / analysis failed: ${truncatedErr}`
+				: "ChatGPT / analysis failed (no error message)",
 			screenshotBase64,
 		};
 	}
@@ -177,6 +198,28 @@ async function getPage() {
 		});
 	}
 	return browser;
+}
+
+// Generic hydration wait helper — waits for DOM to stop changing
+async function waitForDomToSettle(page, maxMs = 8000, quietMs = 1200) {
+	const start = Date.now();
+	let lastHtmlLength = 0;
+	let lastChange = Date.now();
+
+	while (Date.now() - start < maxMs) {
+		const htmlLength = await page.evaluate(
+			() => document.documentElement.outerHTML.length,
+		);
+
+		if (htmlLength !== lastHtmlLength) {
+			lastHtmlLength = htmlLength;
+			lastChange = Date.now();
+		}
+
+		if (Date.now() - lastChange > quietMs) break;
+
+		await page.waitForTimeout(250);
+	}
 }
 
 async function fetchPageHTML(url) {
@@ -279,8 +322,35 @@ async function fetchPageHTML(url) {
 		}
 	}
 
-	// Give Shopify JS time to render critical UI
-	await page.waitForTimeout(1500);
+	// --- SCROLL PATCH FOR LAZY / SCROLL-REVEAL HYDRATION ---
+	try {
+		// Progressive scroll to trigger PageFly / ScrollReveal / lazy components
+		for (let i = 0; i < 6; i++) {
+			await page.evaluate(() => {
+				window.scrollBy(0, window.innerHeight);
+			});
+			await page.waitForTimeout(350);
+		}
+
+		// Scroll back to top so screenshot starts at correct position
+		await page.evaluate(() => window.scrollTo(0, 0));
+		await page.waitForTimeout(300);
+	} catch (e) {
+		if (DEBUG) console.error("[AI DEBUG] Scroll hydration failed:", e.message);
+	}
+
+	// Generic hydration wait before waiting for DOM to settle
+	try {
+		await Promise.race([
+			page.waitForSelector('button:has-text("Add")', { timeout: 5000 }),
+			page.waitForSelector("*:text-matches(/£|€|\\$/i)", { timeout: 5000 }),
+			page.waitForSelector("form input", { timeout: 5000 }),
+			page.waitForTimeout(5000),
+		]);
+	} catch {}
+
+	// Wait for hydration / DOM stability (works for Shopify, Wix, Squarespace, custom sites)
+	await waitForDomToSettle(page);
 
 	if (!resp) {
 		const screenshotBase64 = await safeScreenshot();
@@ -382,30 +452,51 @@ async function fetchPageHTML(url) {
 }
 
 // -----------------------------
-// AI ANALYSIS (DEEPSEEK)
+// AI ANALYSIS (ChatGPT)
 // -----------------------------
-async function askDeepseek(html, url) {
-	const cleanedHtml = await minify(html || "", {
-		collapseWhitespace: true,
-		removeComments: true,
+function sleep(ms) {
+	return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
-		minifyCSS: true,
-		minifyJS: true,
+async function askChatGPT(html, url, screenshotBase64) {
+	if (DEBUG)
+		console.log(
+			"[AI DEBUG] Starting askChatGPT for URL:",
+			url,
+			"raw HTML length:",
+			(html || "").length,
+		);
 
-		// KEEP all attributes & ordering
-		removeRedundantAttributes: false,
-		removeScriptTypeAttributes: false,
-		removeStyleLinkTypeAttributes: false,
-		collapseBooleanAttributes: false,
-		sortAttributes: false,
-		sortClassName: false,
+	let cleanedHtml;
+	try {
+		cleanedHtml = await minify(html || "", {
+			collapseWhitespace: true,
+			removeComments: true,
 
-		// Do not decode or reformat entities
-		decodeEntities: false,
+			minifyCSS: true,
+			minifyJS: true,
 
-		// Preserve structure
-		keepClosingSlash: true,
-	});
+			removeRedundantAttributes: false,
+			removeScriptTypeAttributes: false,
+			removeStyleLinkTypeAttributes: false,
+			collapseBooleanAttributes: false,
+			sortAttributes: false,
+			sortClassName: false,
+			decodeEntities: false,
+			keepClosingSlash: true,
+		});
+		if (DEBUG)
+			console.log("[AI DEBUG] Minified HTML length:", cleanedHtml.length);
+	} catch (err) {
+		if (DEBUG) {
+			console.error(
+				"[AI DEBUG] HTML minify failed, falling back to raw HTML:",
+				err?.message,
+			);
+		}
+		cleanedHtml = html || "";
+	}
+
 	const prompt = `
 You are an expert product-page auditor for e-commerce websites (primarily Shopify, WooCommerce, Squarespace, and custom stores).
 
@@ -421,100 +512,128 @@ You MUST return ONLY valid JSON in this exact structure:
 NO extra text, no commentary, only JSON.
 
 --------------------------------------
-RULES FOR CLASSIFICATION
---------------------------------------
-
-### 1. "available"
-Choose **available** only when ALL of the following are true:
-
-- The page clearly represents a **specific product page** (not a collection, not a blog post, not a category).
-- A **purchase action** is clearly present, such as:
-  - "Add to cart"
-  - "Add to bag"
-  - "Add to basket"
-  - "Buy now"
-  - "Subscribe" (if this refers to buying a subscription coffee product)
-  - A button allowing the user to select a variant and purchase
-
-AND:
-
-- There is a **price** displayed OR a price selector for variants.
-
-### 2. "unavailable"
-Choose **unavailable** when ANY of the following are true:
-
-- The page shows explicit unavailability indicators:
-  - "Sold out"
-  - "Out of stock"
-  - "Unavailable"
-  - "Currently unavailable"
-  - A disabled purchase button
-  - "No longer available"
-  - "Product not found"
-- The page is **not the correct product page**:
-  - Redirects to a collection or homepage
-  - Shows multiple products instead of one item
-  - It is a blog article or content page
-  - It is a 404, 410, or empty state page
-  - Price or purchase button is completely missing and the page clearly is not purchasable
-
-### 3. "uncertain"
-Use **uncertain** ONLY when BOTH are true:
-
-- The page seems to be a product page (has product title, description, etc.)
-- But you cannot confidently determine availability because:
-  - The HTML is incomplete, broken, or truncated BUT you can still identify it as a product page without clear purchase indicators
-  - Content is ambiguous
-  - Price exists but purchase options are unclear
-  - "Add to cart" may be dynamically inserted and is not visible in the HTML snippet
-  - No explicit sold-out indicators, but also no purchase button visible
-
-If you are missing essential elements and cannot make a confident judgment, choose **uncertain**.
-
---------------------------------------
-IMPORTANT LOGIC RULES
---------------------------------------
-
-- If the page is **not a real product page**, the result is **unavailable** (NOT uncertain).
-- If the product title appears but the page looks like a **collection grid**, classify as **unavailable**.
-- If the product clearly exists but HTML is too incomplete to see buy options → **uncertain**.
-- If there is ANY clear "sold out" text → **unavailable**.
-- If there is an "add to cart/bag/basket" OR a "buy now" visible → **available**.
-- Use conservative judgment. When in doubt between available/unavailable,
-  choose **uncertain**, NOT available.
-- Do NOT choose "uncertain" solely because HTML is malformed or incomplete — make a best‑effort judgment using whatever product signals remain.
-
---------------------------------------
 INPUT DATA
 --------------------------------------
 
 URL: ${url}
 
 Below is raw HTML of the fetched page (may be truncated):
-IMPORTANT: The HTML may be malformed or truncated — you must still attempt best‑effort classification.
+IMPORTANT: The HTML may be malformed or truncated — you must still attempt best-effort classification.
 
 ${cleanedHtml.slice(0, 30000)}
 `;
 
-	const res = await axiosClient.post(
-		"https://api.deepseek.com/v1/chat/completions",
-		{
-			model: "deepseek-chat",
-			temperature: 0,
-			messages: [{ role: "user", content: prompt }],
-		},
-		{
-			headers: {
-				Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}`,
-				"Content-Type": "application/json",
-			},
-		},
-	);
+	if (DEBUG) console.log("[AI DEBUG] Prompt length:", prompt.length);
+	// --- CLEANED HTML STATS DEBUG ---
+	if (DEBUG) {
+		console.log("[AI DEBUG] --- CLEANED HTML STATS ---");
+		console.log("[AI DEBUG] Cleaned HTML length:", cleanedHtml.length);
+		console.log("[AI DEBUG] First 1500 chars of cleaned HTML:");
+		console.log(cleanedHtml.slice(0, 1500));
+		console.log("[AI DEBUG] Last 1500 chars of cleaned HTML:");
+		console.log(cleanedHtml.slice(-1500));
+	}
+	// --- GPT PROMPT DEBUG ---
+	if (DEBUG) {
+		console.log("[AI DEBUG] --- GPT PROMPT (FIRST 2000 CHARS) ---");
+		console.log(prompt.slice(0, 2000));
+		console.log("[AI DEBUG] --- GPT PROMPT (LAST 2000 CHARS) ---");
+		console.log(prompt.slice(-2000));
+	}
 
-	try {
-		return JSON.parse(res.data.choices[0].message.content);
-	} catch {
-		return { status: "uncertain", reason: "Invalid AI JSON" };
+	const maxRetries = 3;
+	let attempt = 0;
+
+	while (true) {
+		try {
+			const res = await axiosClient.post(
+				"https://api.openai.com/v1/chat/completions",
+				{
+					model: "gpt-4o",
+					temperature: 0,
+					response_format: { type: "json_object" },
+					messages: [
+						{
+							role: "user",
+							content: [
+								{ type: "text", text: prompt },
+								...(screenshotBase64
+									? [
+											{
+												type: "image_url",
+												image_url: {
+													url: `data:image/webp;base64,${screenshotBase64}`,
+												},
+											},
+										]
+									: []),
+							],
+						},
+					],
+				},
+				{
+					headers: {
+						Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+						"Content-Type": "application/json",
+					},
+				},
+			);
+
+			const content = res.data?.choices?.[0]?.message?.content;
+			if (DEBUG)
+				console.log("[AI DEBUG] Raw ChatGPT response content:", content);
+
+			try {
+				const parsed = JSON.parse(content);
+				if (DEBUG) console.log("[AI DEBUG] Parsed ChatGPT JSON:", parsed);
+				return parsed;
+			} catch (parseErr) {
+				if (DEBUG) {
+					console.error(
+						"[AI DEBUG] JSON.parse failed on ChatGPT content:",
+						parseErr?.message,
+					);
+				}
+				return {
+					status: "uncertain",
+					reason: `Invalid AI JSON. Raw content: ${String(content).slice(
+						0,
+						500,
+					)}`,
+				};
+			}
+		} catch (err) {
+			const status = err?.response?.status;
+			if (status === 429 && attempt < maxRetries) {
+				const delayMs = 2000 * 2 ** attempt; // 2s, 4s, 8s
+				if (DEBUG) {
+					console.error(
+						"[AI DEBUG] Received 429 Too Many Requests, retrying in",
+						delayMs,
+						"ms (attempt",
+						attempt + 1,
+						"of",
+						maxRetries,
+						")",
+					);
+				}
+				attempt += 1;
+				await sleep(delayMs);
+				continue;
+			}
+
+			if (DEBUG)
+				console.error("[AI DEBUG] Error inside askChatGPT:", err?.message);
+			if (DEBUG && err?.response) {
+				console.error("[AI DEBUG] ChatGPT HTTP status:", err.response.status);
+				console.error(
+					"[AI DEBUG] ChatGPT error body:",
+					JSON.stringify(err.response.data),
+				);
+			}
+			// Re-throw so checkOneItem can see it
+			throw err;
+		}
 	}
 }
 

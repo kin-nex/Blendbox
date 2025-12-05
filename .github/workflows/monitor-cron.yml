@@ -29,6 +29,7 @@ jobs:
           NOTION_DB_ID: ${{ secrets.NOTION_DB_ID }}
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
           ALERT_EMAILS: ${{ secrets.ALERT_EMAILS }}
         run: node index.js
