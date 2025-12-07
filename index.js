@@ -239,7 +239,10 @@ async function fetchPageHTML(url) {
 	async function safeScreenshot() {
 		try {
 			const buf = await page.screenshot({ fullPage: true });
-			const compressed = await sharp(buf).webp({ quality: 60 }).toBuffer();
+			const compressed = await sharp(buf)
+				.resize({ width: 600 })
+				.webp({ quality: 30 })
+				.toBuffer();
 			return compressed.toString("base64");
 		} catch {
 			return null;
@@ -373,7 +376,8 @@ async function fetchPageHTML(url) {
 			clip: { x: 0, y: 0, width: 1280, height: 2000 },
 		});
 		const compressed = await sharp(screenshotBuffer)
-			.webp({ quality: 60 })
+			.resize({ width: 600 })
+			.webp({ quality: 30 })
 			.toBuffer();
 		const screenshotBase64 = compressed.toString("base64");
 
@@ -394,7 +398,8 @@ async function fetchPageHTML(url) {
 			clip: { x: 0, y: 0, width: 1280, height: 2000 },
 		});
 		const compressed = await sharp(screenshotBuffer)
-			.webp({ quality: 60 })
+			.resize({ width: 600 })
+			.webp({ quality: 30 })
 			.toBuffer();
 		const screenshotBase64 = compressed.toString("base64");
 		await context.close();
@@ -431,7 +436,8 @@ async function fetchPageHTML(url) {
 	if (blockIndicators.some((s) => lower.includes(s))) {
 		const htmlCapture = html;
 		const compressed = await sharp(screenshotBuffer)
-			.webp({ quality: 60 })
+			.resize({ width: 600 })
+			.webp({ quality: 30 })
 			.toBuffer();
 		const screenshotBase64 = compressed.toString("base64");
 		await context.close();
@@ -444,7 +450,8 @@ async function fetchPageHTML(url) {
 	}
 
 	const compressed = await sharp(screenshotBuffer)
-		.webp({ quality: 60 })
+		.resize({ width: 600 })
+		.webp({ quality: 30 })
 		.toBuffer();
 	const screenshotBase64 = compressed.toString("base64");
 	await context.close();
@@ -549,7 +556,7 @@ ${cleanedHtml.slice(0, 30000)}
 			const res = await axiosClient.post(
 				"https://api.openai.com/v1/chat/completions",
 				{
-					model: "gpt-4o",
+					model: "gpt-4o-mini",
 					temperature: 0,
 					response_format: { type: "json_object" },
 					messages: [
