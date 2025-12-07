@@ -2,7 +2,7 @@ name: Blendbox Monitor
 
 on:
   schedule:
-    - cron: "0 0 * * *"   # Runs once every 24 hours at 00:00 UTC
+    - cron: "0 */12 * * *"   # Runs every 12 hours UTC
   workflow_dispatch:         # Allows manual trigger
 
 jobs:

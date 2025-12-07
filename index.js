@@ -556,9 +556,9 @@ ${cleanedHtml.slice(0, 30000)}
 			const res = await axiosClient.post(
 				"https://api.openai.com/v1/chat/completions",
 				{
-					model: "gpt-4o-mini",
-					temperature: 0,
+					model: "gpt-5-nano",
 					response_format: { type: "json_object" },
+					service_tier: "flex",
 					messages: [
 						{
 							role: "user",
